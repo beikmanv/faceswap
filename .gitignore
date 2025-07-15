@@ -1,0 +1,12 @@
+venv/
+old-venv-backup/
+__pycache__/
+*.onnx
+*.mp4
+*.png
+*.jpg
+*.DS_Store
+assets/
+Real-ESRGAN/inputs/
+Real-ESRGAN/tests/data/
+Real-ESRGAN/assets/
