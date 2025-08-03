@@ -7,6 +7,7 @@ import uuid
 
 from swap import swap_faces
 from upscale import upscale_image
+from face_utils import extract_face_region, paste_upscaled_face
 
 app = FastAPI()
 
@@ -31,20 +32,34 @@ async def swap_faces_api(
     job_id = str(uuid.uuid4())
     source_path = f"{OUTPUT_DIR}/{job_id}_source.jpg"
     target_path = f"{OUTPUT_DIR}/{job_id}_target.jpg"
-    output_path = f"{OUTPUT_DIR}/{job_id}_output.png"
+    swapped_path = f"{OUTPUT_DIR}/{job_id}_swapped.png"
 
     with open(source_path, "wb") as f:
         f.write(await source.read())
     with open(target_path, "wb") as f:
         f.write(await target.read())
 
-    swap_faces(source_path, target_path, output_path)
+    # Step 1: Run Roop face swap
+    swap_faces(source_path, target_path, swapped_path)
+    print("✅ FaceSwap done:", swapped_path)
 
-    print("✅ FaceSwap done:", f"/static/output/{os.path.basename(output_path)}")
+    # Step 2: Extract face from swapped result
+    face_img, coords = extract_face_region(swapped_path)
+    cropped_face_path = f"{OUTPUT_DIR}/{job_id}_face_crop.png"
+    face_img.save(cropped_face_path)
+
+    # Step 3: Upscale the cropped face
+    upscaled_face_path = upscale_image(cropped_face_path)
+
+    # Step 4: Paste it back into full image
+    final_output_path = f"{OUTPUT_DIR}/{job_id}_final.png"
+    paste_upscaled_face(swapped_path, upscaled_face_path, coords, final_output_path)
+
+    print("✅ Final image with upscaled face:", final_output_path)
 
     return JSONResponse(content={
         "success": True,
-        "download_url": f"/static/output/{os.path.basename(output_path)}"
+        "download_url": f"/static/output/{os.path.basename(final_output_path)}"
     })
 
 @app.post("/upscale")
