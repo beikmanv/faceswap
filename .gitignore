@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+
+# Environment
+venv/
+.env
+
+# Output
+static/output/
+*.png
+*.jpg
+*.jpeg
+*.mp4
+
+# Model files
+*.onnx
+*.pt
+*.pth
+*.bin
+
+# Mac system files
+.DS_Store
