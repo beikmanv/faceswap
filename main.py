@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,68 +28,55 @@ OUTPUT_DIR = "static/output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-
 @app.post("/swap")
 async def swap_faces_api(
+    request: Request,
     source: UploadFile = File(...),
     target: UploadFile = File(...),
-    selected_face_coords: str = Form(...),
+    selected_face_index: int = Form(0),  # default to 0 for safety
 ):
     job_id = str(uuid.uuid4())
-    source_path = f"{OUTPUT_DIR}/{job_id}_source.jpg"
-    target_path = f"{OUTPUT_DIR}/{job_id}_target.jpg"
-    cropped_face_path = f"{OUTPUT_DIR}/{job_id}_target_face_crop.jpg"
-    swapped_face_path = f"{OUTPUT_DIR}/{job_id}_swapped_face.png"
-    swapped_face_masked_out = f"{OUTPUT_DIR}/{job_id}_swapped_face_out.png"
-    final_output_path = f"{OUTPUT_DIR}/{job_id}_final.png"
-
-    # Save input files
-    with open(source_path, "wb") as f:
-        f.write(await source.read())
-    with open(target_path, "wb") as f:
-        f.write(await target.read())
+    print(f"\n[DEBUG] /swap called with job_id={job_id}")
 
     try:
-        Image.open(source_path).verify()
-        Image.open(target_path).verify()
-    except UnidentifiedImageError:
-        return JSONResponse(status_code=400, content={"error": "Invalid image uploaded."})
-
-    try:
-        selected_coords = tuple(json.loads(selected_face_coords))  # [top, right, bottom, left]
-    except Exception:
-        return JSONResponse(status_code=400, content={"error": "Invalid face coordinates format."})
-
-    # Mask everything except the selected face
-    try:
-        masked_img, _ = create_masked_target(target_path, selected_coords)
-    except ValueError as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
-
-    masked_img.save(cropped_face_path)
-
-    # Run face swap
-    swap_faces(source_path, cropped_face_path, swapped_face_path)
-
-    # Extract the swapped face using facial landmarks mask
-    try:
-        masked_face_img, face_bbox = mask_and_extract_face(swapped_face_path)
+        print(f"[DEBUG] Request form fields: {await request.form()}")
+        print(f"[DEBUG] Source filename: {source.filename}")
+        print(f"[DEBUG] Target filename: {target.filename}")
+        print(f"[DEBUG] Selected face index: {selected_face_index}")
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"❌ Face masking failed: {str(e)}"})
+        print(f"[ERROR] Reading request form failed: {e}")
+        return JSONResponse(status_code=400, content={"error": "Invalid form data"})
 
-    masked_face_img.save(swapped_face_masked_out)
+    try:
+        source_path = f"{OUTPUT_DIR}/{job_id}_source.jpg"
+        target_path = f"{OUTPUT_DIR}/{job_id}_target.jpg"
+        swapped_face_path = f"{OUTPUT_DIR}/{job_id}_swapped_face.png"
 
-    # Upscale the masked face
-    upscaled_face_path = upscale_image(swapped_face_masked_out)
-    upscaled_face_img = Image.open(upscaled_face_path).convert("RGBA")
+        # Save files
+        with open(source_path, "wb") as f:
+            f.write(await source.read())
+        with open(target_path, "wb") as f:
+            f.write(await target.read())
 
-    # Paste final upscaled face on original target
-    paste_masked_face(target_path, upscaled_face_img, face_bbox, final_output_path)
+        # Check face in source
+        img = face_recognition.load_image_file(source_path)
+        face_locs = face_recognition.face_locations(img)
+        print(f"[DEBUG] Source face count: {len(face_locs)}")
+        if not face_locs:
+            return JSONResponse(status_code=400, content={"error": "No face in source."})
 
-    return JSONResponse(content={
-        "success": True,
-        "download_url": f"/static/output/{os.path.basename(final_output_path)}"
-    })
+        # Swap
+        swap_faces(source_path, target_path, swapped_face_path, selected_face_index)
+
+        return JSONResponse(content={
+            "success": True,
+            "download_url": f"/static/output/{os.path.basename(swapped_face_path)}"
+        })
+
+    except Exception as e:
+        print(f"[ERROR] Swap failed: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
 
 
 @app.post("/detect_faces")
