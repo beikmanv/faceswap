@@ -9,10 +9,11 @@ from PIL import Image, UnidentifiedImageError
 import io
 import base64
 import json
+import numpy as np
 
 from swap import swap_faces
 from upscale import upscale_image
-from face_utils import mask_and_extract_face, paste_masked_face, create_masked_target
+from face_utils import mask_and_extract_face, paste_masked_face, create_masked_target, get_roop_faces
 
 app = FastAPI()
 
@@ -104,3 +105,49 @@ async def detect_faces_api(image: UploadFile = File(...)):
         })
 
     return JSONResponse(content={"faces": results})
+
+@app.post("/upscale")
+async def upscale_only_api(request: Request, image: UploadFile = File(...)):
+    try:
+        job_id = str(uuid.uuid4())
+        print("[DEBUG] Upscale request received. Job ID:", job_id)
+
+        input_path = f"{OUTPUT_DIR}/{job_id}_upscale_input.png"
+        with open(input_path, "wb") as f:
+            f.write(await image.read())
+        print("[DEBUG] Image saved to:", input_path)
+
+        output_path = upscale_image(input_path)
+        print("[DEBUG] Upscaled image saved to:", output_path)
+
+        full_url = request.base_url._url.rstrip("/") + f"/static/output/{os.path.basename(output_path)}"
+        print("✅ Upscale done:", full_url)
+
+        return JSONResponse(content={
+            "success": True,
+            "download_url": f"/static/output/{os.path.basename(output_path)}"
+        })
+
+    except Exception as e:
+        print("[ERROR] Upscale failed:", str(e))
+        return JSONResponse(status_code=500, content={"error": f"Upscale failed: {str(e)}"})
+    
+@app.post("/detect_faces_roop")
+async def detect_faces_roop(image: UploadFile = File(...)):
+    contents = await image.read()
+    img_np = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
+
+    results = []
+    for face in get_roop_faces(img_np):
+        pil_img = Image.fromarray(face["face_img"])
+        buffer = io.BytesIO()
+        pil_img.save(buffer, format="JPEG")
+        thumbnail = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        results.append({
+            "index": int(face["index"]),
+            "coords": [int(c) for c in face["coords"]],
+            "thumbnail": f"data:image/jpeg;base64,{thumbnail}"
+        })
+
+    return JSONResponse(content={"faces": results})
+

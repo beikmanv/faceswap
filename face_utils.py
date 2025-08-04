@@ -2,6 +2,8 @@ import os
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 import face_recognition
+import insightface
+import threading
 
 def mask_and_extract_face(image_path, face_index=0):
     """Create a smooth RGBA mask of the face using facial landmarks."""
@@ -72,4 +74,33 @@ def create_masked_target(image_path, selected_coords, padding=60):
     black_img[top_pad:bottom_pad, left_pad:right_pad] = img[top_pad:bottom_pad, left_pad:right_pad]
 
     return Image.fromarray(black_img), (top_pad, right_pad, bottom_pad, left_pad)
+
+_face_analyser = None
+_face_analyser_lock = threading.Lock()
+
+def get_roop_face_analyser():
+    global _face_analyser
+    with _face_analyser_lock:
+        if _face_analyser is None:
+            _face_analyser = insightface.app.FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+            _face_analyser.prepare(ctx_id=0)
+    return _face_analyser
+
+def get_roop_faces(image_np):
+    analyser = get_roop_face_analyser()
+    faces = analyser.get(image_np)
+    results = []
+
+    for idx, face in enumerate(faces):
+        bbox = face.bbox.astype(int)  # [left, top, right, bottom]
+        left, top, right, bottom = bbox[0], bbox[1], bbox[2], bbox[3]
+        face_img = image_np[top:bottom, left:right]
+        results.append({
+            "index": idx,
+            "coords": [top, right, bottom, left],
+            "bbox": bbox,
+            "face_img": face_img
+        })
+    return results
+
 
