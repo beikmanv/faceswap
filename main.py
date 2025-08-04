@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,7 +12,7 @@ import json
 
 from swap import swap_faces
 from upscale import upscale_image
-from face_utils import extract_face_region, paste_upscaled_face, extract_face_by_index, crop_exact_region, blur_all_but_selected_face
+from face_utils import mask_and_extract_face, paste_masked_face, create_masked_target
 
 app = FastAPI()
 
@@ -28,72 +28,69 @@ OUTPUT_DIR = "static/output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+
 @app.post("/swap")
 async def swap_faces_api(
     source: UploadFile = File(...),
     target: UploadFile = File(...),
-    selected_face_coords: str = Form(...),  # <-- updated here
+    selected_face_coords: str = Form(...),
 ):
     job_id = str(uuid.uuid4())
     source_path = f"{OUTPUT_DIR}/{job_id}_source.jpg"
     target_path = f"{OUTPUT_DIR}/{job_id}_target.jpg"
     cropped_face_path = f"{OUTPUT_DIR}/{job_id}_target_face_crop.jpg"
     swapped_face_path = f"{OUTPUT_DIR}/{job_id}_swapped_face.png"
+    swapped_face_masked_out = f"{OUTPUT_DIR}/{job_id}_swapped_face_out.png"
     final_output_path = f"{OUTPUT_DIR}/{job_id}_final.png"
 
-    # Save uploads
+    # Save input files
     with open(source_path, "wb") as f:
         f.write(await source.read())
     with open(target_path, "wb") as f:
         f.write(await target.read())
 
-    # Validate image
     try:
         Image.open(source_path).verify()
         Image.open(target_path).verify()
     except UnidentifiedImageError:
         return JSONResponse(status_code=400, content={"error": "Invalid image uploaded."})
 
-    # Parse coordinates from form field
     try:
         selected_coords = tuple(json.loads(selected_face_coords))  # [top, right, bottom, left]
     except Exception:
         return JSONResponse(status_code=400, content={"error": "Invalid face coordinates format."})
 
-    # Blur all other faces and get padded coords
+    # Mask everything except the selected face
     try:
-        masked_img, padded_coords = blur_all_but_selected_face(target_path, selected_coords)
+        masked_img, _ = create_masked_target(target_path, selected_coords)
     except ValueError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
 
-    masked_img.save(cropped_face_path)  # Used as Roop target input
+    masked_img.save(cropped_face_path)
 
-    # Swap face
+    # Run face swap
     swap_faces(source_path, cropped_face_path, swapped_face_path)
 
-    print("🧠 Padded Coords:", padded_coords)
-    print("📏 Image size:", Image.open(swapped_face_path).size)
+    # Extract the swapped face using facial landmarks mask
+    try:
+        masked_face_img, face_bbox = mask_and_extract_face(swapped_face_path)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"❌ Face masking failed: {str(e)}"})
 
-    # Step 1: Crop swapped face using padded coords
-    swapped_face_img = crop_exact_region(swapped_face_path, padded_coords)
+    masked_face_img.save(swapped_face_masked_out)
 
-    if swapped_face_img.width == 0 or swapped_face_img.height == 0:
-        return JSONResponse(status_code=500, content={"error": "❌ Cropped swapped face is empty. Face detection or Roop may have failed."})
+    # Upscale the masked face
+    upscaled_face_path = upscale_image(swapped_face_masked_out)
+    upscaled_face_img = Image.open(upscaled_face_path).convert("RGBA")
 
-    print("🔍 Cropped face size:", swapped_face_img.size)
-
-    # Step 2: Save that face and upscale
-    swapped_face_out_path = f"{OUTPUT_DIR}/{job_id}_swapped_face_out.png"
-    swapped_face_img.save(swapped_face_out_path)
-    upscaled_face_path = upscale_image(swapped_face_out_path)
-
-    # Step 3: Paste upscaled face back to target
-    paste_upscaled_face(target_path, upscaled_face_path, padded_coords, final_output_path)
+    # Paste final upscaled face on original target
+    paste_masked_face(target_path, upscaled_face_img, face_bbox, final_output_path)
 
     return JSONResponse(content={
         "success": True,
         "download_url": f"/static/output/{os.path.basename(final_output_path)}"
     })
+
 
 @app.post("/detect_faces")
 async def detect_faces_api(image: UploadFile = File(...)):
@@ -120,4 +117,3 @@ async def detect_faces_api(image: UploadFile = File(...)):
         })
 
     return JSONResponse(content={"faces": results})
-
