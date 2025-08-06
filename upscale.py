@@ -53,6 +53,7 @@ def upscale_image(image_path: str) -> str:
     ]
 
     print(f"[INFO] Running upscaler with tile size: {tile_size}")
+    print("[DEBUG] Upscaler command:", " ".join(cmd))
     subprocess.run(cmd, check=True)
 
     return out_path
