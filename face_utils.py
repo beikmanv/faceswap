@@ -4,33 +4,40 @@ from PIL import Image, ImageDraw, ImageFilter
 import face_recognition
 import insightface
 import threading
+from itertools import chain
 
 def mask_and_extract_face(image_path, face_index=0):
-    """Create a smooth RGBA mask of the face using facial landmarks."""
-    image = face_recognition.load_image_file(image_path)
-    landmarks_list = face_recognition.face_landmarks(image)
+    """Extract full face region using InsightFace bounding box."""
+    from PIL import ImageDraw, ImageFilter
 
-    if not landmarks_list or face_index >= len(landmarks_list):
-        raise ValueError("No valid face detected.")
+    image = Image.open(image_path).convert("RGBA")
+    image_np = np.array(image.convert("RGB"))
 
-    landmarks = landmarks_list[face_index]
-    face_outline = landmarks["chin"]
+    faces = get_roop_faces(image_np)
 
-    # Create binary mask using chin outline
-    mask_img = Image.new("L", (image.shape[1], image.shape[0]), 0)
-    ImageDraw.Draw(mask_img).polygon(face_outline, outline=255, fill=255)
-    mask_img = mask_img.filter(ImageFilter.GaussianBlur(3))  # Feather edges
+    if not faces or face_index >= len(faces):
+        raise ValueError("Face index out of range or no faces detected.")
 
-    # Convert original to RGBA and apply mask as alpha
-    pil_img = Image.fromarray(image).convert("RGBA")
-    r, g, b, _ = pil_img.split()
-    final_img = Image.merge("RGBA", (r, g, b, mask_img))
+    face = faces[face_index]
+    top, right, bottom, left = face["coords"]
 
-    # Crop tightly to masked face region
-    bbox = mask_img.getbbox()
-    cropped_face = final_img.crop(bbox)
+    # Create a mask the same size as the image
+    mask = Image.new("L", image.size, 0)
+    draw = ImageDraw.Draw(mask)
+    draw.rectangle([left, top, right, bottom], fill=255)
 
-    return cropped_face, bbox
+    # Optionally feather the mask edges
+    mask = mask.filter(ImageFilter.GaussianBlur(3))
+
+    # Apply alpha mask to image
+    r, g, b, _ = image.split()
+    masked_face = Image.merge("RGBA", (r, g, b, mask))
+
+    # Crop to bounding box
+    cropped = masked_face.crop((left, top, right, bottom))
+
+    return cropped, (left, top, right, bottom)
+
 
 
 def paste_masked_face(target_path, masked_face_img, bbox, output_path):
