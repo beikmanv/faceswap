@@ -16,6 +16,15 @@ from swap import swap_faces
 from upscale import upscale_image
 from face_utils import mask_and_extract_face, paste_masked_face, create_masked_target, get_roop_faces
 
+import torch
+import torch.nn.functional as F
+from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
+
+# Load face parsing model
+processor = SegformerImageProcessor.from_pretrained("jonathandinu/face-parsing")
+segformer = SegformerForSemanticSegmentation.from_pretrained("jonathandinu/face-parsing")
+segformer.to("cpu")  # or "cuda" if available
+
 app = FastAPI()
 
 @app.middleware("http")
@@ -45,14 +54,12 @@ async def swap_faces_api(
     source: UploadFile = File(...),
     target: UploadFile = File(...),
     selected_face_index: int = Form(0),
-    selected_face_bbox: str = Form(None),
 ):
     job_id = str(uuid.uuid4())
     print(f"\n[DEBUG] /swap called with job_id={job_id}")
     print(f"[DEBUG] Received source file: {source.filename}")
     print(f"[DEBUG] Received target file: {target.filename}")
     print(f"[DEBUG] selected_face_index: {selected_face_index}")
-    print(f"[DEBUG] selected_face_bbox (raw): {selected_face_bbox}")
 
     try:
         # === Save uploaded files ===
@@ -81,49 +88,51 @@ async def swap_faces_api(
         swap_faces(source_path, target_path, swapped_path, selected_face_index)
         print("[INFO] Roop face swap succeeded.")
 
-        # === Check and parse bbox ===
-        if not selected_face_bbox:
-            print("[ERROR] No selected_face_bbox provided.")
-            return JSONResponse(status_code=400, content={"error": "No selected_face_bbox provided."})
+        # === Extract face from swapped image ===
+        swapped_img_np = np.array(Image.open(swapped_path).convert("RGB"))
+        faces = get_roop_faces(swapped_img_np)
 
-        try:
-            coords = json.loads(selected_face_bbox)
-            top, right, bottom, left = coords
-            print(f"[DEBUG] Parsed bbox: {coords}")
-        except Exception as e:
-            print(f"[ERROR] Failed to parse selected_face_bbox: {e}")
-            return JSONResponse(status_code=400, content={"error": "Invalid selected_face_bbox format."})
+        if selected_face_index >= len(faces):
+            return JSONResponse(status_code=400, content={"error": "Invalid selected_face_index."})
 
-        # === Clamp crop coordinates ===
-        swapped_img = Image.open(swapped_path).convert("RGBA")
-        img_width, img_height = swapped_img.size
-        top = max(0, min(top, img_height))
-        bottom = max(0, min(bottom, img_height))
-        left = max(0, min(left, img_width))
-        right = max(0, min(right, img_width))
-
-        print(f"[DEBUG] Clamped bbox: top={top}, bottom={bottom}, left={left}, right={right}")
-
-        if top >= bottom or left >= right:
-            print("[ERROR] Invalid crop dimensions.")
-            return JSONResponse(status_code=400, content={"error": "Invalid crop coordinates after clamping."})
-
-        # === Crop and upscale ===
-        cropped_face = swapped_img.crop((left, top, right, bottom))
+        face_data = faces[selected_face_index]
+        top, right, bottom, left = face_data["coords"]
+        cropped_face_np = face_data["face_img"]
+        cropped_face = Image.fromarray(cropped_face_np).convert("RGB")
         temp_cropped_path = f"/tmp/cropped_{uuid.uuid4().hex}.png"
-        cropped_face.save(temp_cropped_path)
-        print(f"[DEBUG] Cropped face saved at: {temp_cropped_path}")
 
+        # === Apply SegFormer face mask ===
+        inputs = processor(images=cropped_face, return_tensors="pt").to(segformer.device)
+        outputs = segformer(**inputs)
+        logits = outputs.logits  # shape: (1, 19, 128, 128)
+        logits = F.interpolate(
+            logits, size=cropped_face.size[::-1], mode="bilinear", align_corners=False
+        )
+        labels = logits.argmax(dim=1)[0].cpu().numpy()
+
+        FACE_LABELS = [1, 2, 3, 4, 5, 6, 7, 8, 9]  # skin, brows, eyes, nose, lips, etc.
+        mask_array = np.isin(labels, FACE_LABELS).astype(np.uint8) * 255
+        mask_img = Image.fromarray(mask_array, mode="L")
+
+        cropped_face.putalpha(mask_img)
+        cropped_face.save(temp_cropped_path)
+        masked_face = cropped_face
+
+        print(f"[DEBUG] Masked + cropped face saved at: {temp_cropped_path}")
+
+        # === Upscaling ===
         print("[DEBUG] Upscaling...")
         upscaled_path = upscale_image(temp_cropped_path)
         upscaled_face = Image.open(upscaled_path).convert("RGBA")
         print(f"[DEBUG] Upscaled face image: {upscaled_path}")
 
-        # === Resize and paste ===
+        # === Resize + Paste ===
         width, height = right - left, bottom - top
         resized_upscaled_face = upscaled_face.resize((width, height), Image.LANCZOS)
+        swapped_img = Image.open(swapped_path).convert("RGBA")
         swapped_img.paste(resized_upscaled_face, (left, top), resized_upscaled_face)
         swapped_img.convert("RGB").save(final_path)
+
         print(f"[INFO] Final image saved at: {final_path}")
 
         return JSONResponse(content={
@@ -134,6 +143,7 @@ async def swap_faces_api(
     except Exception as e:
         print(f"[ERROR] Swap+Upscale failed: {str(e)}")
         return JSONResponse(status_code=500, content={"error": f"Swap+Upscale failed: {str(e)}"})
+
 
 
 
