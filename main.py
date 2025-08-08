@@ -11,6 +11,7 @@ import base64
 import json
 import numpy as np
 from fastapi.responses import Response
+import cv2
 
 from swap import swap_faces
 from upscale import upscale_image
@@ -93,22 +94,41 @@ async def swap_faces_api(
         cropped_face = swapped_img.crop((left, top, right, bottom)).convert("RGB")
 
         # === Generate SegFormer mask ===
-        inputs = processor(images=cropped_face, return_tensors="pt").to(segformer.device)
+        face_for_masking = cropped_face.resize((256, 256), Image.LANCZOS)
+        # Resize before parsing for better lip/eye/nose detection
+        face_for_masking = cropped_face.resize((256, 256), Image.LANCZOS)
+        inputs = processor(images=face_for_masking, return_tensors="pt").to(segformer.device)
         outputs = segformer(**inputs)
         logits = outputs.logits
         logits = F.interpolate(logits, size=cropped_face.size[::-1], mode="bilinear", align_corners=False)
         labels = logits.argmax(dim=1)[0].cpu().numpy()
 
-        FACE_LABELS = [1, 2, 3, 4, 5, 6, 7, 8, 9]  # face parts
+        FACE_LABELS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16,]  # face parts
         mask_array = np.isin(labels, FACE_LABELS).astype(np.uint8) * 255
-        mask = Image.fromarray(mask_array, mode="L")
+        
+        # === Optional: Expand + smooth the mask ===
+        kernel = np.ones((10, 10), np.uint8)
+        mask_array_dilated = cv2.dilate(mask_array, kernel, iterations=3)
+        mask_img = Image.fromarray(mask_array_dilated, mode="L").filter(ImageFilter.GaussianBlur(radius=3))
 
         # === Apply mask to cropped face ===
         cropped_rgba = cropped_face.convert("RGBA")
-        cropped_rgba.putalpha(mask)
+        cropped_rgba.putalpha(mask_img)
+
+        # === Save cropped face to temp file
+        temp_face_path = f"/tmp/cropped_face_{uuid.uuid4().hex}.png"
+        cropped_rgba.save(temp_face_path)
+
+        # === Upscale the face only
+        upscaled_face_path = upscale_image(temp_face_path)
+        upscaled_face = Image.open(upscaled_face_path).convert("RGBA")
+
+        # === Resize back to original bounding box size
+        orig_width, orig_height = right - left, bottom - top
+        resized_face = upscaled_face.resize((orig_width, orig_height), Image.LANCZOS)
 
         # === Paste masked face onto original target ===
-        target_img.paste(cropped_rgba, (left, top), cropped_rgba)
+        target_img.paste(resized_face, (left, top), resized_face)
         target_img.convert("RGB").save(final_path)
 
         print(f"[✅] Final clean swap saved at: {final_path}")
