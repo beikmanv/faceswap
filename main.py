@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import os
 import uuid
 import face_recognition
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, UnidentifiedImageError, ImageFilter
 import io
 import base64
 import json
@@ -57,93 +57,69 @@ async def swap_faces_api(
 ):
     job_id = str(uuid.uuid4())
     print(f"\n[DEBUG] /swap called with job_id={job_id}")
-    print(f"[DEBUG] Received source file: {source.filename}")
-    print(f"[DEBUG] Received target file: {target.filename}")
-    print(f"[DEBUG] selected_face_index: {selected_face_index}")
-
     try:
-        # === Save uploaded files ===
+        # === Save uploaded images ===
         source_path = f"{OUTPUT_DIR}/{job_id}_source.jpg"
         target_path = f"{OUTPUT_DIR}/{job_id}_target.jpg"
-        swapped_path = f"{OUTPUT_DIR}/{job_id}_swapped.png"
-        final_path = f"{OUTPUT_DIR}/{job_id}_swapped_upscaled.png"
+        roop_output_path = f"{OUTPUT_DIR}/{job_id}_roop_swapped.png"
+        final_path = f"{OUTPUT_DIR}/{job_id}_clean_swap_final.jpg"
 
         with open(source_path, "wb") as f:
             f.write(await source.read())
-        print(f"[DEBUG] Saved source to: {source_path}")
-
         with open(target_path, "wb") as f:
             f.write(await target.read())
-        print(f"[DEBUG] Saved target to: {target_path}")
 
-        # === Validate source face ===
-        print(f"[DEBUG] Checking face in source...")
+        # === Validate source face exists ===
         img = face_recognition.load_image_file(source_path)
         if not face_recognition.face_locations(img):
-            print("[ERROR] No face found in source.")
             return JSONResponse(status_code=400, content={"error": "No face in source."})
 
-        # === Face swap ===
-        print("[DEBUG] Performing face swap...")
-        swap_faces(source_path, target_path, swapped_path, selected_face_index)
+        # === Run Roop Face Swap ===
+        print("[DEBUG] Running Roop...")
+        swap_faces(source_path, target_path, roop_output_path, selected_face_index)
         print("[INFO] Roop face swap succeeded.")
 
-        # === Extract face from swapped image ===
-        swapped_img_np = np.array(Image.open(swapped_path).convert("RGB"))
-        faces = get_roop_faces(swapped_img_np)
+        # === Load Roop output and extract face region ===
+        swapped_img = Image.open(roop_output_path).convert("RGB")
+        target_img = Image.open(target_path).convert("RGBA")
 
+        # === Detect face in Roop output ===
+        faces = get_roop_faces(np.array(swapped_img))
         if selected_face_index >= len(faces):
             return JSONResponse(status_code=400, content={"error": "Invalid selected_face_index."})
 
         face_data = faces[selected_face_index]
         top, right, bottom, left = face_data["coords"]
-        cropped_face_np = face_data["face_img"]
-        cropped_face = Image.fromarray(cropped_face_np).convert("RGB")
-        temp_cropped_path = f"/tmp/cropped_{uuid.uuid4().hex}.png"
+        cropped_face = swapped_img.crop((left, top, right, bottom)).convert("RGB")
 
-        # === Apply SegFormer face mask ===
+        # === Generate SegFormer mask ===
         inputs = processor(images=cropped_face, return_tensors="pt").to(segformer.device)
         outputs = segformer(**inputs)
-        logits = outputs.logits  # shape: (1, 19, 128, 128)
-        logits = F.interpolate(
-            logits, size=cropped_face.size[::-1], mode="bilinear", align_corners=False
-        )
+        logits = outputs.logits
+        logits = F.interpolate(logits, size=cropped_face.size[::-1], mode="bilinear", align_corners=False)
         labels = logits.argmax(dim=1)[0].cpu().numpy()
 
-        FACE_LABELS = [1, 2, 3, 4, 5, 6, 7, 8, 9]  # skin, brows, eyes, nose, lips, etc.
+        FACE_LABELS = [1, 2, 3, 4, 5, 6, 7, 8, 9]  # face parts
         mask_array = np.isin(labels, FACE_LABELS).astype(np.uint8) * 255
-        mask_img = Image.fromarray(mask_array, mode="L")
+        mask = Image.fromarray(mask_array, mode="L")
 
-        cropped_face.putalpha(mask_img)
-        cropped_face.save(temp_cropped_path)
-        masked_face = cropped_face
+        # === Apply mask to cropped face ===
+        cropped_rgba = cropped_face.convert("RGBA")
+        cropped_rgba.putalpha(mask)
 
-        print(f"[DEBUG] Masked + cropped face saved at: {temp_cropped_path}")
+        # === Paste masked face onto original target ===
+        target_img.paste(cropped_rgba, (left, top), cropped_rgba)
+        target_img.convert("RGB").save(final_path)
 
-        # === Upscaling ===
-        print("[DEBUG] Upscaling...")
-        upscaled_path = upscale_image(temp_cropped_path)
-        upscaled_face = Image.open(upscaled_path).convert("RGBA")
-        print(f"[DEBUG] Upscaled face image: {upscaled_path}")
-
-        # === Resize + Paste ===
-        width, height = right - left, bottom - top
-        resized_upscaled_face = upscaled_face.resize((width, height), Image.LANCZOS)
-        swapped_img = Image.open(swapped_path).convert("RGBA")
-        swapped_img.paste(resized_upscaled_face, (left, top), resized_upscaled_face)
-        swapped_img.convert("RGB").save(final_path)
-
-        print(f"[INFO] Final image saved at: {final_path}")
-
+        print(f"[✅] Final clean swap saved at: {final_path}")
         return JSONResponse(content={
             "success": True,
             "download_url": f"/static/output/{os.path.basename(final_path)}"
         })
 
     except Exception as e:
-        print(f"[ERROR] Swap+Upscale failed: {str(e)}")
-        return JSONResponse(status_code=500, content={"error": f"Swap+Upscale failed: {str(e)}"})
-
+        print(f"[❌ ERROR] Swap failed: {e}")
+        return JSONResponse(status_code=500, content={"error": f"Swap failed: {str(e)}"})
 
 
 
