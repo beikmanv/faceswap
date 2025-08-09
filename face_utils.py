@@ -38,8 +38,6 @@ def mask_and_extract_face(image_path, face_index=0):
 
     return cropped, (left, top, right, bottom)
 
-
-
 def paste_masked_face(target_path, masked_face_img, bbox, output_path):
     base_img = Image.open(target_path).convert("RGBA")
 
@@ -109,5 +107,69 @@ def get_roop_faces(image_np):
             "face_img": face_img
         })
     return results
+
+def crop_source_face_to_temp(source_path: str, chosen_index: int, margin: float = 0.3) -> str:
+    """
+    Crops the chosen face from the source image with a margin, saves a temp PNG, and returns its path.
+    If detection fails or index invalid, returns the original source_path.
+    """
+    try:
+        src_img = Image.open(source_path).convert("RGB")
+        src_np = np.array(src_img)
+        faces = get_roop_faces(src_np)
+        if not faces or chosen_index >= len(faces) or chosen_index < 0:
+            print(f"[WARN] Source face index {chosen_index} not found; using full source.")
+            return source_path
+
+        top, right, bottom, left = faces[chosen_index]["coords"]
+        h, w = src_np.shape[:2]
+
+        # expand bbox by margin
+        bw, bh = (right - left), (bottom - top)
+        cx, cy = left + bw / 2.0, top + bh / 2.0
+        new_w, new_h = int(bw * (1 + margin)), int(bh * (1 + margin))
+        nx1 = max(0, int(cx - new_w / 2))
+        ny1 = max(0, int(cy - new_h / 2))
+        nx2 = min(w, int(cx + new_w / 2))
+        ny2 = min(h, int(cy + new_h / 2))
+
+        # safety: ensure at least some size
+        if nx2 <= nx1 or ny2 <= ny1:
+            print("[WARN] Invalid crop after margin; using full source.")
+            return source_path
+
+        cropped = src_img.crop((nx1, ny1, nx2, ny2))
+        temp_src_path = f"/tmp/source_face_{uuid.uuid4().hex}.png"
+        cropped.save(temp_src_path)
+        print(f"[DEBUG] Temp source face saved: {temp_src_path} (index={chosen_index})")
+        return temp_src_path
+    except Exception as e:
+        print(f"[WARN] Could not crop source face: {e}; using full source.")
+        return source_path
+    
+    # --- helpers for parsing indices from form fields ---
+def _parse_indices(s: str, default=None):
+    """
+    Accepts:
+      - JSON list string: "[0,2,3]"
+      - comma list: "0,2,3"
+      - single number: "1"
+      - empty/None -> default
+    Returns a list[int].
+    """
+    if s is None or s == "":
+        return default if default is not None else []
+    s = s.strip()
+    try:
+        # try JSON first
+        import json
+        v = json.loads(s)
+        if isinstance(v, list):
+            return [int(x) for x in v]
+        return [int(v)]
+    except Exception:
+        # fallback: comma-separated
+        parts = [p.strip() for p in s.split(",") if p.strip() != ""]
+        return [int(p) for p in parts] if parts else (default if default is not None else [])
 
 

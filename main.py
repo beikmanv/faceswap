@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -10,16 +10,14 @@ import io
 import base64
 import json
 import numpy as np
-from fastapi.responses import Response
 import cv2
-
-from swap import swap_faces
-from upscale import upscale_image
-from face_utils import mask_and_extract_face, paste_masked_face, create_masked_target, get_roop_faces
-
 import torch
 import torch.nn.functional as F
+from swap import swap_faces
+from upscale import upscale_image
+from face_utils import mask_and_extract_face, paste_masked_face, create_masked_target, get_roop_faces, crop_source_face_to_temp, _parse_indices
 from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
+
 
 # Load face parsing model
 processor = SegformerImageProcessor.from_pretrained("jonathandinu/face-parsing")
@@ -54,7 +52,9 @@ async def swap_faces_api(
     request: Request,
     source: UploadFile = File(...),
     target: UploadFile = File(...),
-    selected_face_index: int = Form(0),
+    selected_face_index: int = Form(0),                 # backward-compat (single target face)
+    selected_source_face_index: int = Form(0),          # selfie face to use
+    selected_target_face_indices: str = Form("[]"),     # JSON or CSV list, e.g. "[0,2]" or "0,2"
 ):
     job_id = str(uuid.uuid4())
     print(f"\n[DEBUG] /swap called with job_id={job_id}")
@@ -62,9 +62,6 @@ async def swap_faces_api(
         # === Save uploaded images ===
         source_path = f"{OUTPUT_DIR}/{job_id}_source.jpg"
         target_path = f"{OUTPUT_DIR}/{job_id}_target.jpg"
-        roop_output_path = f"{OUTPUT_DIR}/{job_id}_roop_swapped.png"
-        final_path = f"{OUTPUT_DIR}/{job_id}_clean_swap_final.jpg"
-
         with open(source_path, "wb") as f:
             f.write(await source.read())
         with open(target_path, "wb") as f:
@@ -75,63 +72,89 @@ async def swap_faces_api(
         if not face_recognition.face_locations(img):
             return JSONResponse(status_code=400, content={"error": "No face in source."})
 
-        # === Run Roop Face Swap ===
-        print("[DEBUG] Running Roop...")
-        swap_faces(source_path, target_path, roop_output_path, selected_face_index)
-        print("[INFO] Roop face swap succeeded.")
+        # === Parse target indices (fallback to old single index) ===
+        target_indices = _parse_indices(selected_target_face_indices, default=None)
+        if not target_indices:
+            target_indices = [int(selected_face_index)]
 
-        # === Load Roop output and extract face region ===
-        swapped_img = Image.open(roop_output_path).convert("RGB")
-        target_img = Image.open(target_path).convert("RGBA")
+        # === Make a temp source that contains ONLY the selected selfie face ===
+        temp_source_path = crop_source_face_to_temp(
+            source_path=source_path,
+            chosen_index=int(selected_source_face_index),
+            margin=0.35,  # tweak 0.25–0.5
+        )
 
-        # === Detect face in Roop output ===
-        faces = get_roop_faces(np.array(swapped_img))
-        if selected_face_index >= len(faces):
-            return JSONResponse(status_code=400, content={"error": "Invalid selected_face_index."})
+        # === Accumulating canvas (start from original target) ===
+        target_base_img = Image.open(target_path).convert("RGBA")
 
-        face_data = faces[selected_face_index]
-        top, right, bottom, left = face_data["coords"]
-        cropped_face = swapped_img.crop((left, top, right, bottom)).convert("RGB")
+        # === Process each requested target face ===
+        for i, tgt_idx in enumerate(target_indices):
+            roop_output_path = f"{OUTPUT_DIR}/{job_id}_roop_swapped_{i}.png"
 
-        # === Generate SegFormer mask ===
-        face_for_masking = cropped_face.resize((256, 256), Image.LANCZOS)
-        # Resize before parsing for better lip/eye/nose detection
-        face_for_masking = cropped_face.resize((256, 256), Image.LANCZOS)
-        inputs = processor(images=face_for_masking, return_tensors="pt").to(segformer.device)
-        outputs = segformer(**inputs)
-        logits = outputs.logits
-        logits = F.interpolate(logits, size=cropped_face.size[::-1], mode="bilinear", align_corners=False)
-        labels = logits.argmax(dim=1)[0].cpu().numpy()
+            # 1) Run Roop for THIS target face index using the cropped source face
+            print(f"[DEBUG] Running Roop for target face index {tgt_idx} ...")
+            # IMPORTANT: your swap_faces wrapper must NOT pass --source-face-index
+            swap_faces(
+                source_path=temp_source_path,
+                target_path=target_path,      # always swap against the original target
+                output_path=roop_output_path,
+                target_face_index=int(tgt_idx)
+            )
 
-        FACE_LABELS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16,]  # face parts
-        mask_array = np.isin(labels, FACE_LABELS).astype(np.uint8) * 255
-        
-        # === Optional: Expand + smooth the mask ===
-        kernel = np.ones((10, 10), np.uint8)
-        mask_array_dilated = cv2.dilate(mask_array, kernel, iterations=3)
-        mask_img = Image.fromarray(mask_array_dilated, mode="L").filter(ImageFilter.GaussianBlur(radius=3))
+            # 2) Load Roop output and locate the same face index region
+            swapped_img = Image.open(roop_output_path).convert("RGB")
+            faces = get_roop_faces(np.array(swapped_img))
+            if int(tgt_idx) >= len(faces):
+                print(f"[WARN] Target face index {tgt_idx} not found in Roop output; skipping.")
+                continue
 
-        # === Apply mask to cropped face ===
-        cropped_rgba = cropped_face.convert("RGBA")
-        cropped_rgba.putalpha(mask_img)
+            face_data = faces[int(tgt_idx)]
+            top, right, bottom, left = face_data["coords"]
+            cropped_face = swapped_img.crop((left, top, right, bottom)).convert("RGB")
 
-        # === Save cropped face to temp file
-        temp_face_path = f"/tmp/cropped_face_{uuid.uuid4().hex}.png"
-        cropped_rgba.save(temp_face_path)
+            # 3) SegFormer face mask (optionally include hair/neck)
+            face_for_masking = cropped_face.resize((256, 256), Image.LANCZOS)
+            inputs = processor(images=face_for_masking, return_tensors="pt").to(segformer.device)
+            outputs = segformer(**inputs)
+            logits = outputs.logits
+            logits = F.interpolate(logits, size=cropped_face.size[::-1], mode="bilinear", align_corners=False)
+            labels = logits.argmax(dim=1)[0].cpu().numpy()
 
-        # === Upscale the face only
-        upscaled_face_path = upscale_image(temp_face_path)
-        upscaled_face = Image.open(upscaled_face_path).convert("RGBA")
+            # skin, brows, eyes, nose, lips, hair, neck (tweak as you prefer)
+            FACE_LABELS = [1,2,3,4,5,6,7,8,9,10,11,12,13,17]
+            mask_array = np.isin(labels, FACE_LABELS).astype(np.uint8) * 255
 
-        # === Resize back to original bounding box size
-        orig_width, orig_height = right - left, bottom - top
-        resized_face = upscaled_face.resize((orig_width, orig_height), Image.LANCZOS)
+            # 4) Grow the mask a bit (optional)
+            kernel = np.ones((10, 10), np.uint8)
+            mask_dilated = cv2.dilate(mask_array, kernel, iterations=2)
 
-        # === Paste masked face onto original target ===
-        target_img.paste(resized_face, (left, top), resized_face)
-        target_img.convert("RGB").save(final_path)
+            # 5) Alpha feathering via distance transform (smoother than blur)
+            dist = cv2.distanceTransform(mask_dilated, cv2.DIST_L2, 5)
+            dist_norm = cv2.normalize(dist, None, 0, 1.0, cv2.NORM_MINMAX)
+            FEATHER_RADIUS = 20.0
+            alpha = np.clip(dist_norm / (FEATHER_RADIUS / 255.0), 0, 1)
+            alpha_mask = (alpha * 255).astype(np.uint8)
 
-        print(f"[✅] Final clean swap saved at: {final_path}")
+            mask_img = Image.fromarray(alpha_mask, mode="L")
+            cropped_rgba = cropped_face.convert("RGBA")
+            cropped_rgba.putalpha(mask_img)
+
+            # 6) Upscale the masked face only
+            temp_face_path = f"/tmp/cropped_face_{uuid.uuid4().hex}.png"
+            cropped_rgba.save(temp_face_path)
+            upscaled_face_path = upscale_image(temp_face_path)
+            upscaled_face = Image.open(upscaled_face_path).convert("RGBA")
+
+            # 7) Resize to original bbox and paste with alpha onto the accumulating canvas
+            width, height = right - left, bottom - top
+            resized_face = upscaled_face.resize((width, height), Image.LANCZOS)
+            target_base_img.paste(resized_face, (left, top), resized_face)
+
+        # === Save final composited image ===
+        final_path = f"{OUTPUT_DIR}/{job_id}_clean_swap_final.jpg"
+        target_base_img.convert("RGB").save(final_path)
+
+        print(f"[✅] Final clean multi-swap saved at: {final_path}")
         return JSONResponse(content={
             "success": True,
             "download_url": f"/static/output/{os.path.basename(final_path)}"
@@ -140,7 +163,6 @@ async def swap_faces_api(
     except Exception as e:
         print(f"[❌ ERROR] Swap failed: {e}")
         return JSONResponse(status_code=500, content={"error": f"Swap failed: {str(e)}"})
-
 
 
 @app.post("/detect_faces_roop")
