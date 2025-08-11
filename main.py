@@ -140,7 +140,7 @@ async def swap_faces_api(
                 source_path=temp_source,
                 target_path=target_path,
                 output_path=roop_out,
-                selected_face_index=roop_idx
+                selected_face_bbox=tuple(map(int, intended_bbox)),  # (l,t,r,b)
             )
 
             # 4) find same region on swapped image (LTRB everywhere)
