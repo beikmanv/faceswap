@@ -1,7 +1,8 @@
 import threading, uuid
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image
 import insightface
+import json
 
 # ---------- InsightFace analyzer (shared) ----------
 _face_analyser = None
@@ -15,67 +16,36 @@ def get_roop_face_analyser():
                 name='buffalo_l',
                 providers=['CPUExecutionProvider']
             )
-            _face_analyser.prepare(ctx_id=0)
+            _face_analyser.prepare(ctx_id=0, det_size=(640, 640))
     return _face_analyser
 
 
 def get_roop_faces(image_np):
-    """Return list of dicts with index, coords [t,r,b,l], bbox (np array), and cropped face."""
+    """
+    Return list of dicts with index and bbox (LTRB).
+    LTRB = (left, top, right, bottom)
+    """
     analyser = get_roop_face_analyser()
     faces = analyser.get(image_np)
     results = []
     for idx, face in enumerate(faces):
         # face.bbox: [left, top, right, bottom]
-        left, top, right, bottom = face.bbox.astype(int)
-        face_img = image_np[top:bottom, left:right]
+        l, t, r, b = [int(v) for v in face.bbox]
+        face_img = image_np[t:b, l:r]
         results.append({
             "index": idx,
-            "coords": [int(top), int(right), int(bottom), int(left)],
-            "bbox": face.bbox.astype(int),
+            "bbox": (l, t, r, b),   # <-- canonical: LTRB
             "face_img": face_img
         })
     return results
 
 
-def crop_source_face_to_temp(source_path: str, chosen_index: int, margin: float = 0.35) -> str:
+def bbox_iou(a_ltrb, b_ltrb):
     """
-    Crop just the selected face from the source image (with a margin) so Roop
-    uses the intended face. Returns the path to a temp PNG; falls back to original path.
+    IoU for LTRB boxes: (left, top, right, bottom)
     """
-    try:
-        src_img = Image.open(source_path).convert("RGB")
-        src_np = np.array(src_img)
-        faces = get_roop_faces(src_np)
-        if not faces or chosen_index < 0 or chosen_index >= len(faces):
-            print(f"[WARN] crop_source_face_to_temp: index {chosen_index} not found — using full source.")
-            return source_path
-
-        top, right, bottom, left = faces[chosen_index]["coords"]
-        h, w = src_np.shape[:2]
-        bw, bh = (right - left), (bottom - top)
-        cx, cy = left + bw / 2.0, top + bh / 2.0
-
-        new_w, new_h = int(bw * (1 + margin)), int(bh * (1 + margin))
-        x1 = max(0, int(cx - new_w / 2))
-        y1 = max(0, int(cy - new_h / 2))
-        x2 = min(w, int(cx + new_w / 2))
-        y2 = min(h, int(cy + new_h / 2))
-        if x2 <= x1 or y2 <= y1:
-            return source_path
-
-        cropped = src_img.crop((x1, y1, x2, y2))
-        tmp = f"/tmp/source_face_{uuid.uuid4().hex}.png"
-        cropped.save(tmp)
-        print(f"[DEBUG] Temp source face saved -> {tmp}")
-        return tmp
-    except Exception as e:
-        print(f"[WARN] crop_source_face_to_temp failed: {e}; using full source.")
-        return source_path
-    
-def bbox_iou(a, b):
-    # (top, right, bottom, left)
-    at, ar, ab, al = map(int, a)
-    bt, br, bb, bl = map(int, b)
+    al, at, ar, ab = map(int, a_ltrb)
+    bl, bt, br, bb = map(int, b_ltrb)
     ix1, iy1 = max(al, bl), max(at, bt)
     ix2, iy2 = min(ar, br), min(ab, bb)
     iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
@@ -85,84 +55,113 @@ def bbox_iou(a, b):
     union = max(a_area + b_area - inter, 1e-6)
     return inter / union
 
-def match_face_by_iou(intended_bbox, faces_now):
-    # faces_now entries have "coords" in (top,right,bottom,left)
+
+def match_face_by_iou(intended_bbox_ltrb, faces_now):
+    """
+    faces_now entries must have "bbox" in LTRB.
+    """
     best, best_iou = None, -1.0
     for f in faces_now:
-        iou = bbox_iou(intended_bbox, f["coords"])
+        iou = bbox_iou(intended_bbox_ltrb, f["bbox"])
         if iou > best_iou:
             best, best_iou = f, iou
     return best
 
-def parse_indices(s: str) -> list[int]:
-    if not s:
-        return []
-    s = s.strip()
-    if s.startswith('['):
-        try:
-            return [int(x) for x in json.loads(s)]
-        except Exception:
-            return []
-    return [int(x) for x in s.split(',') if x.strip().isdigit()]
+
+def expand_bbox_ltrb(bbox, margin, img_w, img_h):
+    """
+    Expand an LTRB box by `margin` percent (e.g., 0.25) and clamp to image.
+    """
+    l, t, r, b = map(int, bbox)
+    w, h = (r - l), (b - t)
+    cx, cy = l + w / 2.0, t + h / 2.0
+    nw, nh = w * (1 + margin), h * (1 + margin)
+    nl = max(0, int(cx - nw / 2.0))
+    nt = max(0, int(cy - nh / 2.0))
+    nr = min(img_w, int(cx + nw / 2.0))
+    nb = min(img_h, int(cy + nh / 2.0))
+    return (nl, nt, nr, nb)
+
+
+def map_bbox_to_roop_index(image_path, intended_bbox_ltrb, iou_threshold=0.05):
+    """
+    Given an intended bbox (LTRB), find the Roop detection index with max IoU on that image.
+    """
+    image_np = np.array(Image.open(image_path).convert("RGB"))
+    roop_faces = get_roop_faces(image_np)
+
+    best_idx, best_iou = None, -1.0
+    for face in roop_faces:
+        iou = bbox_iou(intended_bbox_ltrb, face["bbox"])  # LTRB vs LTRB
+        if iou > best_iou:
+            best_iou = iou
+            best_idx = face["index"]
+
+    if best_iou < iou_threshold:
+        print(f"[WARN] map_bbox_to_roop_index: best_iou={best_iou:.3f} < {iou_threshold}")
+        return None
+
+    print(f"[DEBUG] map_bbox_to_roop_index: best_idx={best_idx}, IoU={best_iou:.3f}")
+    return int(best_idx)
+
+
+# (Optional) keep your mse/pick_changed_bbox helpers if you use them elsewhere;
+# if they accept TRBL, convert them to LTRB for consistency too.
 
 def crop_source_face_to_temp(source_path: str, chosen_index: int = 0, margin: float = 0.35) -> str:
-    """Crop the chosen selfie face with a margin and save to /tmp."""
-    src_np = np.array(Image.open(source_path).convert("RGB"))
-    faces = get_roop_faces(src_np)
-    if not faces:
+    """
+    Detect faces in the source image, pick `chosen_index`, expand its LTRB bbox by `margin`,
+    crop to /tmp, and return that temp path. Falls back to original source if something fails.
+    All boxes are LTRB.
+    """
+    try:
+        src_img = Image.open(source_path).convert("RGB")
+        src_np = np.array(src_img)
+
+        faces = get_roop_faces(src_np)  # returns [{"index", "bbox" (LTRB), "face_img"}]
+        if not faces:
+            print("[WARN] crop_source_face_to_temp: no faces found in source — using full source.")
+            return source_path
+
+        if chosen_index < 0 or chosen_index >= len(faces):
+            print(f"[WARN] crop_source_face_to_temp: index {chosen_index} out of range — using 0.")
+            chosen_index = 0
+
+        bbox_ltrb = faces[chosen_index]["bbox"]  # (l, t, r, b)
+        nl, nt, nr, nb = expand_bbox_ltrb(
+            bbox_ltrb, margin=margin,
+            img_w=src_img.width, img_h=src_img.height
+        )
+        if nl >= nr or nt >= nb:
+            print("[WARN] crop_source_face_to_temp: invalid expanded box — using full source.")
+            return source_path
+
+        cropped = src_img.crop((nl, nt, nr, nb))
+        tmp = f"/tmp/source_face_{uuid.uuid4().hex}.png"
+        cropped.save(tmp)
+        print(f"[DEBUG] Temp source face saved -> {tmp}")
+        return tmp
+
+    except Exception as e:
+        print(f"[WARN] crop_source_face_to_temp failed: {e}; using full source.")
         return source_path
-    if chosen_index >= len(faces):
-        chosen_index = 0
-    top, right, bottom, left = [int(v) for v in faces[chosen_index]["coords"]]
-    w, h = right - left, bottom - top
-    cx, cy = left + w // 2, top + h // 2
-    ml, mt = int(w * (1 + margin) / 2), int(h * (1 + margin) / 2)
-    L = max(0, cx - ml); T = max(0, cy - mt)
-    R = min(src_np.shape[1], cx + ml); B = min(src_np.shape[0], cy + mt)
-    crop = Image.fromarray(src_np).crop((L, T, R, B))
-    out = f"/tmp/source_face_{uuid.uuid4().hex}.png"
-    crop.save(out)
-    print(f"[DEBUG] Temp source face saved -> {out}")
-    return out
+    
+    import json
 
-def mse(a: np.ndarray, b: np.ndarray) -> float:
-    a = a.astype(np.float32); b = b.astype(np.float32)
-    diff = a - b
-    return float((diff * diff).mean())
-
-def pick_changed_bbox(target_img: Image.Image,
-                       roop_img: Image.Image,
-                       bboxes_trbl: list[list[int]]) -> tuple[int, list[int]]:
+def parse_indices(raw: str) -> list[int]:
     """
-    Among all target bboxes, find which one changed the most between
-    target_img and roop_img by MSE. Returns (index_in_list, bbox).
+    Accepts '3,17' or '[3, 17]' and returns [3, 17].
+    Returns [] on any parse error.
     """
-    tgt = np.array(target_img.convert("RGB"))
-    out = np.array(roop_img.convert("RGB"))
-    best_i, best_bbox, best_score = -1, None, -1.0
-
-    for i, (top, right, bottom, left) in enumerate(bboxes_trbl):
-        # clamp
-        top = max(0, min(top, tgt.shape[0])); bottom = max(0, min(bottom, tgt.shape[0]))
-        left = max(0, min(left, tgt.shape[1])); right = max(0, min(right, tgt.shape[1]))
-        if top >= bottom or left >= right:
-            continue
-
-        tgt_crop = tgt[top:bottom, left:right]
-        out_crop = out[top:bottom, left:right]
-        if tgt_crop.size == 0 or out_crop.size == 0:
-            continue
-
-        # If shapes differ (can happen rarely), resize roop crop to tgt crop
-        if out_crop.shape != tgt_crop.shape:
-            rh, rw = tgt_crop.shape[0], tgt_crop.shape[1]
-            out_crop_img = Image.fromarray(out_crop).resize((rw, rh), Image.BILINEAR)
-            out_crop = np.array(out_crop_img)
-
-        score = mse(tgt_crop, out_crop)
-        if score > best_score:
-            best_i, best_bbox, best_score = i, [top, right, bottom, left], score
-
-    return best_i, best_bbox
+    if not raw:
+        return []
+    s = raw.strip()
+    try:
+        if s.startswith('['):
+            arr = json.loads(s)
+            return [int(x) for x in arr]
+        return [int(x) for x in s.split(',') if x.strip()]
+    except Exception:
+        return []
 
 

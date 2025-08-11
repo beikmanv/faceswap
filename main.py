@@ -13,7 +13,8 @@ from face_utils import (
     crop_source_face_to_temp,
     bbox_iou,
     match_face_by_iou,
-    parse_indices
+    map_bbox_to_roop_index,
+    expand_bbox_ltrb
 )
 
 app = FastAPI()
@@ -38,20 +39,20 @@ OUTPUT_DIR = "static/output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-
 @app.post("/swap")
 async def swap_faces_api(
     request: Request,
     source: UploadFile = File(...),
     target: UploadFile = File(...),
     selected_source_face_index: int = Form(0),
-    selected_target_face_indices: str = Form("[]"),  # "[3,17]" or "3,17"
+    selected_target_face_indices: str = Form("[]"),
+    selected_face_bboxes: str = Form("[]"),   # TRBL from FE
 ):
- 
     job_id = str(uuid.uuid4())
     print(f"\n[DEBUG] /swap job_id={job_id}")
     print(f"[DEBUG] raw selected_target_face_indices: {selected_target_face_indices!r}")
 
+    # use local parser; remove parse_indices from your imports
     def parse_indices(raw: str):
         if not raw:
             return []
@@ -62,12 +63,22 @@ async def swap_faces_api(
             print("[WARN] parse_indices failed:", e)
             return []
 
-    # Parse once, use everywhere
-    face_indices = parse_indices(selected_target_face_indices)
-    if not face_indices:
-        face_indices = [0]
-    print(f"[INFO] Will swap target indices: {face_indices}")
+    target_indices = parse_indices(selected_target_face_indices) or [0]
+    print(f"[INFO] Will swap target indices: {target_indices}")
 
+    # Parse FE bboxes (TRBL list aligned to indices), convert to LTRB
+    def parse_bboxes(raw: str):
+        try:
+            arr = json.loads(raw) if raw and raw.strip().startswith('[') else []
+            # each arr[i] is [t, r, b, l] -> (l, t, r, b)
+            return [(bb[3], bb[0], bb[1], bb[2]) for bb in arr]
+        except Exception:
+            return []
+
+    fe_bboxes_ltrb = parse_bboxes(selected_face_bboxes)  # may be []
+
+    print(f"[DEBUG] FE bboxes (LTRB): {fe_bboxes_ltrb}")
+    print(f"[DEBUG] target_indices: {target_indices}")
 
     try:
         # 1) Save uploads
@@ -82,79 +93,98 @@ async def swap_faces_api(
         if not face_recognition.face_locations(face_recognition.load_image_file(source_path)):
             return JSONResponse(status_code=400, content={"error": "No face in source."})
 
-        # 3) Parse which targets to swap
-        target_indices = parse_indices(selected_target_face_indices)
-        if not target_indices:
-            target_indices = [0]
-        print(f"[INFO] Will swap target indices: {target_indices}")
-
-        # 4) Detect faces in the original target
+        # 3) Detect faces on ORIGINAL target (fallback + later matching)
         target_np = np.array(Image.open(target_path).convert("RGB"))
-        detected = get_roop_faces(target_np)
+        detected = get_roop_faces(target_np)  # { index, bbox (LTRB), face_img }
         if not detected:
             return JSONResponse(status_code=400, content={"error": "No faces in target."})
         print(f"[INFO] Detected {len(detected)} faces in target.")
-        idx2bbox = {int(d["index"]): [int(c) for c in d["coords"]] for d in detected}
+        idx2bbox_ltrb = {int(d["index"]): tuple(int(v) for v in d["bbox"]) for d in detected}
 
-        # 5) Crop the chosen selfie face
+        # 4) Crop chosen selfie face
         temp_source = crop_source_face_to_temp(
             source_path=source_path,
             chosen_index=int(selected_source_face_index),
             margin=0.35
         )
 
-        # 6) Prepare final canvas
+        # 5) Composite canvas
         canvas = Image.open(target_path).convert("RGBA")
 
+        # 6) For each selected face: choose intended bbox, map to Roop index, swap, upscale, paste
+        # build once, before the loop
+        idx2bbox_ltrb = {int(d["index"]): tuple(int(v) for v in d["bbox"]) for d in detected}
+
         for i, tgt_idx in enumerate(target_indices):
-            if tgt_idx not in idx2bbox:
-                print(f"[WARN] Target index {tgt_idx} not found; skipping.")
+            # 1) choose intended bbox (prefer FE by position)
+            if i < len(fe_bboxes_ltrb) and fe_bboxes_ltrb[i]:
+                intended_bbox = tuple(map(int, fe_bboxes_ltrb[i]))
+            else:
+                intended_bbox = idx2bbox_ltrb.get(int(tgt_idx))
+            if intended_bbox is None:
+                print(f"[WARN] No bbox for UI idx {tgt_idx}; skipping.")
                 continue
 
-            intended_bbox = idx2bbox[tgt_idx]
-            roop_out = f"{OUTPUT_DIR}/{job_id}_roop_{i}.png"
-            print(f"[DEBUG] Roop swapping target index {tgt_idx} -> {roop_out}")
+            print(f"[DEBUG] intended_bbox(LTRB)={intended_bbox}")
 
-            # Run Roop
+            # 2) map bbox -> roop index
+            roop_idx = map_bbox_to_roop_index(target_path, intended_bbox)
+            print(f"[DEBUG] resolved roop_idx={roop_idx} for UI idx {tgt_idx}")
+            if roop_idx is None:
+                print(f"[WARN] No match for intended bbox {intended_bbox}; skipping.")
+                continue
+
+            # 3) swap
+            roop_out = f"{OUTPUT_DIR}/{job_id}_roop_{i}.png"
             swap_faces(
                 source_path=temp_source,
                 target_path=target_path,
                 output_path=roop_out,
-                selected_face_index=int(tgt_idx),
+                selected_face_index=roop_idx
             )
 
-            # Match swapped face by IoU
+            # 4) find same region on swapped image (LTRB everywhere)
             swapped_img = Image.open(roop_out).convert("RGBA")
             faces_now = get_roop_faces(np.array(swapped_img.convert("RGB")))
             matched = match_face_by_iou(intended_bbox, faces_now) if faces_now else None
-            if matched is None:
+            if not matched:
                 print(f"[WARN] Could not match swapped face for idx {tgt_idx}; skipping.")
                 continue
+            print(f"[LOOP] matched_bbox={matched['bbox']} iou={bbox_iou(intended_bbox, matched['bbox']):.3f}")
 
-            # Crop with margin
-            mt, mr, mb, ml = map(int, matched["coords"])
-            margin = 0.25
-            w, h = mr - ml, mb - mt
-            cx, cy = ml + w / 2.0, mt + h / 2.0
-            nl = max(0, int(cx - w * (1 + margin) / 2))
-            nt = max(0, int(cy - h * (1 + margin) / 2))
-            nr = min(swapped_img.width,  int(cx + w * (1 + margin) / 2))
-            nb = min(swapped_img.height, int(cy + h * (1 + margin) / 2))
-
+            # 1) crop region (add a little margin if you like)
+            nl, nt, nr, nb = expand_bbox_ltrb(
+                matched["bbox"], margin=0.25,
+                img_w=swapped_img.width, img_h=swapped_img.height
+            )
             if nl >= nr or nt >= nb:
                 print(f"[WARN] Invalid crop for idx {tgt_idx}; skipping.")
                 continue
 
-            # Upscale + paste
-            face_crop = swapped_img.crop((nl, nt, nr, nb))
-            tmp = f"/tmp/{uuid.uuid4().hex}.png"
-            face_crop.save(tmp)
-            upscaled_path = upscale_image(tmp)
-            upscaled = Image.open(upscaled_path).convert("RGBA")
-            final_face = upscaled.resize((nr - nl, nb - nt), Image.LANCZOS)
-            canvas.paste(final_face, (nl, nt), final_face)
+            target_w, target_h = nr - nl, nb - nt
+            print(f"[LOOP] crop_box={(nl, nt, nr, nb)} size={(target_w, target_h)}")
 
-        # 7) Save final with high quality
+            # 2) save crop and upscale
+            tmp = f"/tmp/{uuid.uuid4().hex}.png"
+            swapped_img.crop((nl, nt, nr, nb)).convert("RGBA").save(tmp)
+            upscaled_path = upscale_image(tmp)
+
+            # 3) ensure mode/size, then blend OVER the canvas patch
+            up = Image.open(upscaled_path).convert("RGBA")
+            if up.size != (target_w, target_h):
+                up = up.resize((target_w, target_h), Image.LANCZOS)
+            print(f"[DEBUG] upscaled size={up.size}, region={(target_w, target_h)}")
+
+            region = canvas.crop((nl, nt, nr, nb)).convert("RGBA")
+            if region.size != up.size:
+                # ultra safety (shouldn’t happen after the resize above)
+                up = up.resize(region.size, Image.LANCZOS)
+
+            blended = Image.alpha_composite(region, up)  # sizes must match
+            canvas.paste(blended, (nl, nt))              # no mask -> no mismatch
+
+
+        # 7) Save final
         final_path = f"{OUTPUT_DIR}/{job_id}_multi_swap_final.jpg"
         canvas.convert("RGB").save(final_path, format="JPEG", quality=95, subsampling=0)
         print(f"[✅] Multi-face swap saved at: {final_path}")
@@ -169,6 +199,7 @@ async def swap_faces_api(
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+
 @app.post("/detect_faces_roop")
 async def detect_faces_roop(image: UploadFile = File(...)):
     contents = await image.read()
@@ -176,17 +207,21 @@ async def detect_faces_roop(image: UploadFile = File(...)):
 
     results = []
     for face in get_roop_faces(img_np):
+        l, t, r, b = face["bbox"]  # LTRB
         pil_img = Image.fromarray(face["face_img"])
         buf = io.BytesIO()
         pil_img.save(buf, format="JPEG")
         thumb = base64.b64encode(buf.getvalue()).decode("utf-8")
         results.append({
             "index": int(face["index"]),
-            "coords": [int(c) for c in face["coords"]],
+            # Only for frontend compatibility:
+            "coords": [int(t), int(r), int(b), int(l)],  # TRBL for display only
+            "bbox": [int(l), int(t), int(r), int(b)],    # LTRB (new field, if you want to use it)
             "thumbnail": f"data:image/jpeg;base64,{thumb}"
         })
 
     return JSONResponse({"faces": results})
+
 
 
 
