@@ -39,14 +39,76 @@ OUTPUT_DIR = "static/output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+@app.get("/ping")
+def ping():
+    return {"ok": True}
+
+
+# --- fetch_image: proxy the external URL so the browser avoids CORS and we prefer jpeg/png ---
+from fastapi import Query, HTTPException
+from fastapi.responses import Response, JSONResponse
+from urllib.parse import urlparse
+import requests
+
+@app.get("/fetch_image")
+def fetch_image(
+    url: str = Query(..., description="Direct image URL"),
+    debug: int = Query(0, description="Return debug info on failure (1)"),
+):
+    p = urlparse(url)
+    if p.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="Only http/https URLs are allowed")
+
+    try:
+        r = requests.get(
+            url,
+            timeout=20,
+            allow_redirects=True,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://faceswap.tilda.ws/",
+                "Accept": "image/jpeg,image/png;q=0.9,image/*;q=0.5,*/*;q=0.1",
+            },
+        )
+        r.raise_for_status()
+        content = r.content
+        ct_header = (r.headers.get("Content-Type") or "").lower().split(";")[0].strip()
+
+        head = content[:16]
+        if head.startswith(b"\xff\xd8\xff"): mime = "image/jpeg"
+        elif head.startswith(b"\x89PNG\r\n\x1a\n"): mime = "image/png"
+        elif head.startswith(b"GIF87a") or head.startswith(b"GIF89a"): mime = "image/gif"
+        elif len(content) >= 12 and head[0:4] == b"RIFF" and head[8:12] == b"WEBP": mime = "image/webp"
+        elif ct_header.startswith("image/"): mime = ct_header
+        else:
+            if debug:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "status": r.status_code,
+                        "content_type": ct_header,
+                        "len": len(content),
+                        "head_hex": content[:64].hex(),
+                        "headers": dict(r.headers),
+                    },
+                )
+            raise HTTPException(status_code=400, detail=f"URL did not return an image (content-type={ct_header})")
+
+        return Response(content=content, media_type=mime, headers={"Cache-Control": "no-store"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": f"Could not fetch image: {e}"})
+
 @app.post("/swap")
 async def swap_faces_api(
     request: Request,
     source: UploadFile = File(...),
-    target: UploadFile = File(...),
+    target: UploadFile = File(None),
     selected_source_face_index: int = Form(0),
     selected_target_face_indices: str = Form("[]"),
     selected_face_bboxes: str = Form("[]"),   # TRBL from FE
+    target_url: str | None = Form(None),
 ):
     job_id = str(uuid.uuid4())
     print(f"\n[DEBUG] /swap job_id={job_id}")
@@ -81,13 +143,67 @@ async def swap_faces_api(
     print(f"[DEBUG] target_indices: {target_indices}")
 
     try:
-        # 1) Save uploads
+                # 1) Save uploads
+                # 1.1) Read uploads ONCE and validate they're real images.
         source_path = f"{OUTPUT_DIR}/{job_id}_source.jpg"
         target_path = f"{OUTPUT_DIR}/{job_id}_target.jpg"
-        with open(source_path, "wb") as f: f.write(await source.read())
-        with open(target_path, "wb") as f: f.write(await target.read())
+
+        source_bytes = await source.read()
+        if not source_bytes:
+            return JSONResponse(status_code=400, content={"error": "Source is empty"})
+        try:
+            Image.open(io.BytesIO(source_bytes)).verify()
+        except Exception:
+            return JSONResponse(status_code=400, content={"error": "Source is not a valid image"})
+        with open(source_path, "wb") as f:
+            f.write(source_bytes)
+
+        # Target: prefer uploaded file; otherwise fetch from target_url
+        target_bytes = b""
+        if target is not None:
+            target_bytes = await target.read()
+
+        if not target_bytes:
+            if target_url and target_url.strip():
+                import requests
+                try:
+                    r = requests.get(
+                        target_url.strip(),
+                        timeout=20,
+                        allow_redirects=True,
+                        headers={
+                            "User-Agent": "Mozilla/5.0",
+                            "Referer": "https://faceswap.tilda.ws/",
+                            "Accept": "image/jpeg,image/png;q=0.9,image/*;q=0.5,*/*;q=0.1",
+                        },
+                    )
+                    r.raise_for_status()
+                    head = r.content[:16]
+                    ct = (r.headers.get("Content-Type") or "").lower().split(";")[0].strip()
+                    if head.startswith(b"\xff\xd8\xff"): pass
+                    elif head.startswith(b"\x89PNG\r\n\x1a\n"): pass
+                    elif head.startswith(b"GIF87a") or head.startswith(b"GIF89a"): pass
+                    elif len(r.content) >= 12 and head[0:4] == b"RIFF" and head[8:12] == b"WEBP": pass
+                    elif not ct.startswith("image/"):
+                        return JSONResponse(status_code=400, content={"error": f"URL did not return an image (content-type={ct})"})
+                    target_bytes = r.content
+                except Exception as ex:
+                    return JSONResponse(status_code=400, content={"error": f"Could not fetch target_url: {ex}"})
+            else:
+                return JSONResponse(status_code=400, content={"error": "No target image or target_url provided"})
+
+        # validate target bytes
+        try:
+            Image.open(io.BytesIO(target_bytes)).verify()
+        except Exception:
+            return JSONResponse(status_code=400, content={"error": "Target is not a valid image"})
+
+        with open(target_path, "wb") as f:
+            f.write(target_bytes)
+
         print(f"[DEBUG] Saved source -> {source_path}")
         print(f"[DEBUG] Saved target -> {target_path}")
+
 
         # 2) Validate source has a face
         if not face_recognition.face_locations(face_recognition.load_image_file(source_path)):
@@ -135,14 +251,14 @@ async def swap_faces_api(
                 continue
 
             # 3) swap
-            roop_out = f"{OUTPUT_DIR}/{job_id}_roop_{i}.png"
-            swap_faces(
+            roop_out_request = f"{OUTPUT_DIR}/{job_id}_roop_{i}.png"
+            roop_out = swap_faces(
                 source_path=temp_source,
                 target_path=target_path,
-                output_path=roop_out,
-                selected_face_bbox=tuple(map(int, intended_bbox)),  # (l,t,r,b)
-            )
-
+                output_path=roop_out_request,
+                selected_face_bbox=tuple(map(int, intended_bbox)),
+)
+            
             # 4) find same region on swapped image (LTRB everywhere)
             swapped_img = Image.open(roop_out).convert("RGBA")
             faces_now = get_roop_faces(np.array(swapped_img.convert("RGB")))
