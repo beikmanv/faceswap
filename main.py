@@ -339,6 +339,37 @@ async def detect_faces_roop(image: UploadFile = File(...)):
     return JSONResponse({"faces": results})
 
 
+@app.post("/detect_faces_roop_url")
+async def detect_faces_roop_url(url: str = Form(...)):
+    try:
+        r = requests.get(
+            url,
+            timeout=20,
+            allow_redirects=True,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://faceswap.tilda.ws/",
+                "Accept": "image/jpeg,image/png;q=0.9,image/*;q=0.5,*/*;q=0.1",
+            },
+        )
+        r.raise_for_status()
+        img_np = np.array(Image.open(io.BytesIO(r.content)).convert("RGB"))
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": f"Could not fetch/decode image: {e}"})
+
+    results = []
+    for face in get_roop_faces(img_np):
+        l, t, r, b = face["bbox"]  # LTRB
+        pil_img = Image.fromarray(face["face_img"])
+        buf = io.BytesIO(); pil_img.save(buf, format="JPEG")
+        thumb = base64.b64encode(buf.getvalue()).decode("utf-8")
+        results.append({
+            "index": int(face["index"]),
+            "coords": [int(t), int(r), int(b), int(l)],  # TRBL for FE
+            "bbox":   [int(l), int(t), int(r), int(b)],  # LTRB
+            "thumbnail": f"data:image/jpeg;base64,{thumb}",
+        })
+    return JSONResponse({"faces": results})
 
 
 @app.post("/upscale")

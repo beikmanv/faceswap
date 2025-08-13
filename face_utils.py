@@ -108,7 +108,7 @@ def map_bbox_to_roop_index(image_path, intended_bbox_ltrb, iou_threshold=0.05):
 # (Optional) keep your mse/pick_changed_bbox helpers if you use them elsewhere;
 # if they accept TRBL, convert them to LTRB for consistency too.
 
-def crop_source_face_to_temp(source_path: str, chosen_index: int = 0, margin: float = 0.35) -> str:
+def crop_source_face_to_temp(source_path: str, chosen_index: int = 0, margin: float = 0.60) -> str:
     """
     Detect faces in the source image, pick `chosen_index`, expand its LTRB bbox by `margin`,
     crop to /tmp, and return that temp path. Falls back to original source if something fails.
