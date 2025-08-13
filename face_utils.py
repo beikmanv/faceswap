@@ -112,13 +112,14 @@ def crop_source_face_to_temp(source_path: str, chosen_index: int = 0, margin: fl
     """
     Detect faces in the source image, pick `chosen_index`, expand its LTRB bbox by `margin`,
     crop to /tmp, and return that temp path. Falls back to original source if something fails.
+    Ensures crop is large enough for Roop to detect the face.
     All boxes are LTRB.
     """
     try:
         src_img = Image.open(source_path).convert("RGB")
         src_np = np.array(src_img)
 
-        faces = get_roop_faces(src_np)  # returns [{"index", "bbox" (LTRB), "face_img"}]
+        faces = get_roop_faces(src_np)  # [{"index", "bbox" (LTRB), "face_img"}]
         if not faces:
             print("[WARN] crop_source_face_to_temp: no faces found in source — using full source.")
             return source_path
@@ -128,26 +129,40 @@ def crop_source_face_to_temp(source_path: str, chosen_index: int = 0, margin: fl
             chosen_index = 0
 
         bbox_ltrb = faces[chosen_index]["bbox"]  # (l, t, r, b)
+
+        # Ensure at least 0.5 margin for Roop
+        safe_margin = max(margin, 0.5)
         nl, nt, nr, nb = expand_bbox_ltrb(
-            bbox_ltrb, margin=margin,
+            bbox_ltrb, margin=safe_margin,
             img_w=src_img.width, img_h=src_img.height
         )
+
         if nl >= nr or nt >= nb:
             print("[WARN] crop_source_face_to_temp: invalid expanded box — using full source.")
             return source_path
 
+        # Enforce minimum crop size
+        MIN_SIZE = 256
+        crop_w, crop_h = nr - nl, nb - nt
+        if crop_w < MIN_SIZE or crop_h < MIN_SIZE:
+            print(f"[INFO] crop_source_face_to_temp: expanding crop to min {MIN_SIZE}px for Roop.")
+            cx, cy = nl + crop_w // 2, nt + crop_h // 2
+            half_w, half_h = max(MIN_SIZE // 2, crop_w // 2), max(MIN_SIZE // 2, crop_h // 2)
+            nl = max(0, cx - half_w)
+            nr = min(src_img.width, cx + half_w)
+            nt = max(0, cy - half_h)
+            nb = min(src_img.height, cy + half_h)
+
         cropped = src_img.crop((nl, nt, nr, nb))
         tmp = f"/tmp/source_face_{uuid.uuid4().hex}.png"
         cropped.save(tmp)
-        print(f"[DEBUG] Temp source face saved -> {tmp}")
+        print(f"[DEBUG] Temp source face saved -> {tmp} (size: {cropped.size})")
         return tmp
 
     except Exception as e:
         print(f"[WARN] crop_source_face_to_temp failed: {e}; using full source.")
         return source_path
     
-    import json
-
 def parse_indices(raw: str) -> list[int]:
     """
     Accepts '3,17' or '[3, 17]' and returns [3, 17].
