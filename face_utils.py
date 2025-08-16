@@ -14,10 +14,21 @@ def get_roop_face_analyser():
         if _face_analyser is None:
             _face_analyser = insightface.app.FaceAnalysis(
                 name='buffalo_l',
-                providers=['CPUExecutionProvider']
+                providers=['CPUExecutionProvider']  # keep as-is for now
             )
+            # prepare once
             _face_analyser.prepare(ctx_id=0, det_size=(640, 640))
+            # If any torch submodules exist, force eval+no_grad by convention
+            try:
+                import torch
+                for name, maybe in vars(_face_analyser).items():
+                    if hasattr(maybe, "eval"):
+                        maybe.eval()
+                torch.set_grad_enabled(False)
+            except Exception:
+                pass
     return _face_analyser
+
 
 
 def get_roop_faces(image_np):

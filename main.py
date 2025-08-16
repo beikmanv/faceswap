@@ -35,13 +35,55 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ===== API contract + infra =====
+import asyncio, time
+try:
+    import torch
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+except Exception:
+    DEVICE = "cpu"
+
+# Concurrency cap (prevent stampedes)
+MAX_CONCURRENCY = 2  # tune 1..2 as you like
+SEM = asyncio.Semaphore(MAX_CONCURRENCY)
+
+# In-memory job store (pretend async)
+# job_id -> {"status": "queued|processing|completed|failed", "download_url": str|None, "error": str|None, "ts": float}
+JOBS: dict[str, dict] = {}
+
+# Validation
+ALLOWED_IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10MB
+
+def _job_ok(job_id: str, download_url: str | None = None):
+    JOBS[job_id] = {"job_id": job_id, "status": "completed", "download_url": download_url, "error": None, "ts": time.time()}
+    return JOBS[job_id]
+
+def _job_fail(job_id: str, msg: str, http=500):
+    JOBS[job_id] = {"job_id": job_id, "status": "failed", "download_url": None, "error": msg, "ts": time.time()}
+    return JSONResponse(status_code=http, content=JOBS[job_id])
+
+def _bad_client(msg: str):
+    # 4xx helper
+    return JSONResponse(status_code=400, content={"success": False, "error": msg})
+
+ALLOWED_IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif", "application/octet-stream"}
+
+def _mime_ok(mime: str | None):
+    # Accept common image types and octet-stream (CDNs often send images that way).
+    # We'll still *verify* bytes with Pillow below.
+    if not mime:
+        return True
+    mime = mime.split(";")[0].strip().lower()
+    return mime in ALLOWED_IMAGE_MIMES
+
+
+
 OUTPUT_DIR = "static/output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-@app.get("/ping")
-def ping():
-    return {"ok": True}
+
 
 
 # --- fetch_image: proxy the external URL so the browser avoids CORS and we prefer jpeg/png ---
@@ -101,218 +143,177 @@ def fetch_image(
         return JSONResponse(status_code=400, content={"error": f"Could not fetch image: {e}"})
 
 @app.post("/swap")
-async def swap_faces_api(
+async def swap_api(
     request: Request,
     source: UploadFile = File(...),
-    target: UploadFile = File(None),
+    target: UploadFile | None = File(None),
     selected_source_face_index: int = Form(0),
+    selected_face_index: int = Form(0),
+    selected_face_bbox: str = Form("[]"),
+    selected_faces: str = Form("[]"),
     selected_target_face_indices: str = Form("[]"),
-    selected_face_bboxes: str = Form("[]"),   # TRBL from FE
-    target_url: str | None = Form(None),
+    selected_face_bboxes: str = Form("[]"),
+    target_url: str = Form(""),
 ):
+    """
+    Contract: returns {success, job_id, status, download_url?, error?}
+    Today it's synchronous under a semaphore, but we reply as if async with status='completed'.
+    """
     job_id = str(uuid.uuid4())
-    print(f"\n[DEBUG] /swap job_id={job_id}")
-    print(f"[DEBUG] raw selected_target_face_indices: {selected_target_face_indices!r}")
+    # Queue semantics (pretend): record 'processing' early so /status works while the request is in-flight
+    JOBS[job_id] = {"job_id": job_id, "status": "processing", "download_url": None, "error": None, "ts": time.time()}
 
-    # use local parser; remove parse_indices from your imports
-    def parse_indices(raw: str):
-        if not raw:
-            return []
-        try:
-            s = raw.strip()
-            return json.loads(s) if s.startswith("[") else [int(x) for x in s.split(",") if x.strip()]
-        except Exception as e:
-            print("[WARN] parse_indices failed:", e)
-            return []
+    # Basic client validation first (return 4xx on bad input)
+    if not source:
+        return _bad_client("Missing 'source' file.")
+    if not target and not (target_url or "").strip():
+        return _bad_client("Provide 'target' file or 'target_url'.")
+    if not _mime_ok(source.content_type):
+        return _bad_client(f"Unsupported source mime {source.content_type}.")
+    if target and not _mime_ok(target.content_type):
+        return _bad_client(f"Unsupported target mime {target.content_type}.")
 
-    target_indices = parse_indices(selected_target_face_indices) or [0]
-    print(f"[INFO] Will swap target indices: {target_indices}")
+    # Size caps (read bytes once)
+    source_bytes = await source.read()
+    if not source_bytes:
+        return _bad_client("Source is empty.")
+    if len(source_bytes) > MAX_IMAGE_BYTES:
+        return _bad_client("Source is too large.")
 
-    # Parse FE bboxes (TRBL list aligned to indices), convert to LTRB
-    def parse_bboxes(raw: str):
-        try:
-            arr = json.loads(raw) if raw and raw.strip().startswith('[') else []
-            # each arr[i] is [t, r, b, l] -> (l, t, r, b)
-            return [(bb[3], bb[0], bb[1], bb[2]) for bb in arr]
-        except Exception:
-            return []
+    target_bytes = b""
+    if target is not None:
+        tb = await target.read()
+        if not tb:
+            return _bad_client("Target is empty.")
+        if len(tb) > MAX_IMAGE_BYTES:
+            return _bad_client("Target is too large.")
+        target_bytes = tb
 
-    fe_bboxes_ltrb = parse_bboxes(selected_face_bboxes)  # may be []
+    # File locations
+    OUTPUT_DIR = "static/output"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    source_path = f"{OUTPUT_DIR}/{job_id}_source.jpg"
+    target_path = f"{OUTPUT_DIR}/{job_id}_target.jpg"
 
-    print(f"[DEBUG] FE bboxes (LTRB): {fe_bboxes_ltrb}")
-    print(f"[DEBUG] target_indices: {target_indices}")
-
+    # Validate as images (Pillow verify)
     try:
-                # 1) Save uploads
-                # 1.1) Read uploads ONCE and validate they're real images.
-        source_path = f"{OUTPUT_DIR}/{job_id}_source.jpg"
-        target_path = f"{OUTPUT_DIR}/{job_id}_target.jpg"
+        Image.open(io.BytesIO(source_bytes)).verify()
+    except Exception:
+        return _bad_client("Source is not a valid image.")
+    with open(source_path, "wb") as f:
+        f.write(source_bytes)
 
-        source_bytes = await source.read()
-        if not source_bytes:
-            return JSONResponse(status_code=400, content={"error": "Source is empty"})
-        try:
-            Image.open(io.BytesIO(source_bytes)).verify()
-        except Exception:
-            return JSONResponse(status_code=400, content={"error": "Source is not a valid image"})
-        with open(source_path, "wb") as f:
-            f.write(source_bytes)
-
-        # Target: prefer uploaded file; otherwise fetch from target_url
-        target_bytes = b""
-        if target is not None:
-            target_bytes = await target.read()
-
-        if not target_bytes:
-            if target_url and target_url.strip():
-                import requests
-                try:
-                    r = requests.get(
-                        target_url.strip(),
-                        timeout=20,
-                        allow_redirects=True,
-                        headers={
-                            "User-Agent": "Mozilla/5.0",
-                            "Referer": "https://faceswap.tilda.ws/",
-                            "Accept": "image/jpeg,image/png;q=0.9,image/*;q=0.5,*/*;q=0.1",
-                        },
-                    )
-                    r.raise_for_status()
-                    head = r.content[:16]
-                    ct = (r.headers.get("Content-Type") or "").lower().split(";")[0].strip()
-                    if head.startswith(b"\xff\xd8\xff"): pass
-                    elif head.startswith(b"\x89PNG\r\n\x1a\n"): pass
-                    elif head.startswith(b"GIF87a") or head.startswith(b"GIF89a"): pass
-                    elif len(r.content) >= 12 and head[0:4] == b"RIFF" and head[8:12] == b"WEBP": pass
-                    elif not ct.startswith("image/"):
-                        return JSONResponse(status_code=400, content={"error": f"URL did not return an image (content-type={ct})"})
-                    target_bytes = r.content
-                except Exception as ex:
-                    return JSONResponse(status_code=400, content={"error": f"Could not fetch target_url: {ex}"})
-            else:
-                return JSONResponse(status_code=400, content={"error": "No target image or target_url provided"})
-
-        # validate target bytes
+    # Target: prefer uploaded file; otherwise download from your existing proxy flow
+    if target_bytes:
         try:
             Image.open(io.BytesIO(target_bytes)).verify()
         except Exception:
-            return JSONResponse(status_code=400, content={"error": "Target is not a valid image"})
-
+            return _bad_client("Target is not a valid image.")
         with open(target_path, "wb") as f:
             f.write(target_bytes)
-
-        print(f"[DEBUG] Saved source -> {source_path}")
-        print(f"[DEBUG] Saved target -> {target_path}")
-
-
-        # 2) Validate source has a face
-        if not face_recognition.face_locations(face_recognition.load_image_file(source_path)):
-            return JSONResponse(status_code=400, content={"error": "No face in source."})
-
-        # 3) Detect faces on ORIGINAL target (fallback + later matching)
-        target_np = np.array(Image.open(target_path).convert("RGB"))
-        detected = get_roop_faces(target_np)  # { index, bbox (LTRB), face_img }
-        if not detected:
-            return JSONResponse(status_code=400, content={"error": "No faces in target."})
-        print(f"[INFO] Detected {len(detected)} faces in target.")
-        idx2bbox_ltrb = {int(d["index"]): tuple(int(v) for v in d["bbox"]) for d in detected}
-
-        # 4) Crop chosen selfie face
-        temp_source = crop_source_face_to_temp(
-            source_path=source_path,
-            chosen_index=int(selected_source_face_index),
-            margin=0.35
+    else:
+        # Use your existing server-side fetch endpoint logic
+        # We call internal function by making an HTTP request to /fetch_image, but since this is the same service
+        # just reuse the python 'requests' you already have below in your file.
+        import requests as _req
+        fetch = _req.get(
+            f"{request.base_url}fetch_image",
+            params={"url": target_url, "debug": "0"},
+            headers={"Accept": "image/*"},
+            timeout=20,
         )
+        if not fetch.ok:
+            return _bad_client("Could not download target_url.")
+        with open(target_path, "wb") as f:
+            f.write(fetch.content)
 
-        # 5) Composite canvas
-        canvas = Image.open(target_path).convert("RGBA")
+    # Parse UI selection payloads (your helpers already exist)
+    def _parse_bbox(s: str):
+        try:
+            arr = json.loads(s) if (s or "").strip().startswith("[") else []
+            return tuple(int(v) for v in arr) if arr else None
+        except Exception:
+            return None
 
-        # 6) For each selected face: choose intended bbox, map to Roop index, swap, upscale, paste
-        # build once, before the loop
-        idx2bbox_ltrb = {int(d["index"]): tuple(int(v) for v in d["bbox"]) for d in detected}
+    fe_bboxes_ltrb = []
+    try:
+        arr = json.loads(selected_face_bboxes) if (selected_face_bboxes or "").strip().startswith("[") else []
+        fe_bboxes_ltrb = [(bb[3], bb[0], bb[1], bb[2]) for bb in arr] if arr else []
+    except Exception:
+        fe_bboxes_ltrb = []
 
-        for i, tgt_idx in enumerate(target_indices):
-            # 1) choose intended bbox (prefer FE by position)
-            if i < len(fe_bboxes_ltrb) and fe_bboxes_ltrb[i]:
-                intended_bbox = tuple(map(int, fe_bboxes_ltrb[i]))
-            else:
-                intended_bbox = idx2bbox_ltrb.get(int(tgt_idx))
-            if intended_bbox is None:
-                print(f"[WARN] No bbox for UI idx {tgt_idx}; skipping.")
-                continue
-
-            print(f"[DEBUG] intended_bbox(LTRB)={intended_bbox}")
-
-            # 2) map bbox -> roop index
-            roop_idx = map_bbox_to_roop_index(target_path, intended_bbox)
-            print(f"[DEBUG] resolved roop_idx={roop_idx} for UI idx {tgt_idx}")
-            if roop_idx is None:
-                print(f"[WARN] No match for intended bbox {intended_bbox}; skipping.")
-                continue
-
-            # 3) swap
-            roop_out_request = f"{OUTPUT_DIR}/{job_id}_roop_{i}.png"
-            roop_out = swap_faces(
-                source_path=temp_source,
-                target_path=target_path,
-                output_path=roop_out_request,
-                selected_face_bbox=tuple(map(int, intended_bbox)),
-)
-            
-            # 4) find same region on swapped image (LTRB everywhere)
-            swapped_img = Image.open(roop_out).convert("RGBA")
-            faces_now = get_roop_faces(np.array(swapped_img.convert("RGB")))
-            matched = match_face_by_iou(intended_bbox, faces_now) if faces_now else None
-            if not matched:
-                print(f"[WARN] Could not match swapped face for idx {tgt_idx}; skipping.")
-                continue
-            print(f"[LOOP] matched_bbox={matched['bbox']} iou={bbox_iou(intended_bbox, matched['bbox']):.3f}")
-
-            # 1) crop region (add a little margin if you like)
-            nl, nt, nr, nb = expand_bbox_ltrb(
-                matched["bbox"], margin=0.25,
-                img_w=swapped_img.width, img_h=swapped_img.height
+    # Do the actual work under a small concurrency gate
+    try:
+        async with SEM:
+            # 1) Crop chosen selfie face (keeps memory lean)
+            temp_source = crop_source_face_to_temp(
+                source_path=source_path,
+                chosen_index=int(selected_source_face_index),
+                margin=0.6
             )
-            if nl >= nr or nt >= nb:
-                print(f"[WARN] Invalid crop for idx {tgt_idx}; skipping.")
-                continue
 
-            target_w, target_h = nr - nl, nb - nt
-            print(f"[LOOP] crop_box={(nl, nt, nr, nb)} size={(target_w, target_h)}")
+            # 2) Detect target faces (for bbox mapping) using your existing util
+            canvas = Image.open(target_path).convert("RGBA")
+            detected = get_roop_faces(np.array(canvas.convert("RGB")))
+            if not detected:
+                return _bad_client("No faces in target.")
 
-            # 2) save crop and upscale
-            tmp = f"/tmp/{uuid.uuid4().hex}.png"
-            swapped_img.crop((nl, nt, nr, nb)).convert("RGBA").save(tmp)
-            upscaled_path = upscale_image(tmp)
+            idx2bbox_ltrb = {int(d["index"]): tuple(int(v) for v in d["bbox"]) for d in detected}
 
-            # 3) ensure mode/size, then blend OVER the canvas patch
-            up = Image.open(upscaled_path).convert("RGBA")
-            if up.size != (target_w, target_h):
-                up = up.resize((target_w, target_h), Image.LANCZOS)
-            print(f"[DEBUG] upscaled size={up.size}, region={(target_w, target_h)}")
+            # Which faces to act on? Keep your current logic: if multiple chosen via chips, iterate them, else single.
+            try:
+                arr = json.loads(selected_target_face_indices) if (selected_target_face_indices or "").strip().startswith("[") else []
+                target_indices = [int(x) for x in arr] if arr else [int(selected_face_index)]
+            except Exception:
+                target_indices = [int(selected_face_index)]
 
-            region = canvas.crop((nl, nt, nr, nb)).convert("RGBA")
-            if region.size != up.size:
-                # ultra safety (shouldn’t happen after the resize above)
-                up = up.resize(region.size, Image.LANCZOS)
+            # Composite
+            for i, tgt_idx in enumerate(target_indices):
+                intended_bbox = fe_bboxes_ltrb[i] if i < len(fe_bboxes_ltrb) and fe_bboxes_ltrb[i] else idx2bbox_ltrb.get(int(tgt_idx))
+                if not intended_bbox:
+                    continue
 
-            blended = Image.alpha_composite(region, up)  # sizes must match
-            canvas.paste(blended, (nl, nt))              # no mask -> no mismatch
+                # Map to roop-face-index
+                roop_idx = map_bbox_to_roop_index(target_path, intended_bbox)
+                # 2.1 swap (your wrapper already normalizes outputs)
+                tmp_out = f"{OUTPUT_DIR}/{job_id}_swap_{i}.jpg"
+                swap_out = swap_faces(
+                    source_path=temp_source,
+                    target_path=target_path,
+                    output_path=tmp_out,
+                    selected_face_index=roop_idx,
+                    selected_face_bbox=None
+                )
 
+                # paste back (and upscale patch for nicer quality)
+                l, t, r, b = intended_bbox
+                nl, nt, nr, nb = max(0, l), max(0, t), min(canvas.width, r), min(canvas.height, b)
+                target_w, target_h = (nr - nl), (nb - nt)
 
-        # 7) Save final
-        final_path = f"{OUTPUT_DIR}/{job_id}_multi_swap_final.jpg"
-        canvas.convert("RGB").save(final_path, format="JPEG", quality=95, subsampling=0)
-        print(f"[✅] Multi-face swap saved at: {final_path}")
+                # upscale full swapped result then crop patch (simple + fast; keeps code stable)
+                upscaled_path = upscale_image(swap_out)
+                up = Image.open(upscaled_path).convert("RGBA")
+                if up.size != canvas.size:
+                    up = up.resize(canvas.size, Image.LANCZOS)
+                patch = up.crop((nl, nt, nr, nb)).convert("RGBA")
 
-        return JSONResponse({
-            "success": True,
-            "download_url": f"/static/output/{os.path.basename(final_path)}"
-        })
+                region = canvas.crop((nl, nt, nr, nb)).convert("RGBA")
+                if region.size != patch.size:
+                    patch = patch.resize(region.size, Image.LANCZOS)
+                blended = Image.alpha_composite(region, patch)
+                canvas.paste(blended, (nl, nt))
+
+            final_path = f"{OUTPUT_DIR}/{job_id}_multi_swap_final.jpg"
+            canvas.convert("RGB").save(final_path, format="JPEG", quality=95, subsampling=0)
 
     except Exception as e:
-        print(f"[❌ ERROR] Swap failed: {e}")
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        # Mark job failed and return 5xx (internal error)
+        return _job_fail(job_id, str(e), http=500)
+
+    # Success: freeze API shape
+    job = _job_ok(job_id, download_url=f"/static/output/{os.path.basename(final_path)}")
+    return JSONResponse({"success": True, **job})
+
 
 
 
@@ -374,15 +375,49 @@ async def detect_faces_roop_url(url: str = Form(...)):
 
 @app.post("/upscale")
 async def upscale_only_api(request: Request, image: UploadFile = File(...)):
+    job_id = str(uuid.uuid4())
+    JOBS[job_id] = {"job_id": job_id, "status": "processing", "download_url": None, "error": None, "ts": time.time()}
+
+    if not image:
+        return _bad_client("Missing 'image' file.")
+    if not _mime_ok(image.content_type):
+        return _bad_client(f"Unsupported mime {image.content_type}.")
+
+    raw = await image.read()
+    if not raw:
+        return _bad_client("Empty image.")
+    if len(raw) > MAX_IMAGE_BYTES:
+        return _bad_client("Image too large.")
+
+    OUTPUT_DIR = "static/output"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     try:
-        job_id = str(uuid.uuid4())
-        inp = f"{OUTPUT_DIR}/{job_id}_upscale_input.png"
-        with open(inp, "wb") as f:
-            f.write(await image.read())
-        out = upscale_image(inp)
-        return JSONResponse({
-            "success": True,
-            "download_url": f"/static/output/{os.path.basename(out)}"
-        })
+        async with SEM:
+            inp = f"{OUTPUT_DIR}/{job_id}_upscale_input.png"
+            with open(inp, "wb") as f:
+                f.write(raw)
+            out = upscale_image(inp)
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return _job_fail(job_id, str(e), http=500)
+
+    job = _job_ok(job_id, download_url=f"/static/output/{os.path.basename(out)}")
+    return JSONResponse({"success": True, **job})
+
+    
+@app.get("/ping")
+def ping():
+    return {"ok": True}
+    
+@app.get("/healthz")
+def healthz():
+    # Lightweight; do not load heavy models here.
+    return {"ok": True}
+
+@app.get("/status/{job_id}")
+def job_status(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        return JSONResponse(status_code=404, content={"job_id": job_id, "status": "failed", "error": "unknown job_id"})
+    # Shape: {job_id, status, download_url?, error?}
+    return JSONResponse(job)
+
