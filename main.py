@@ -246,7 +246,7 @@ async def swap_api(
     fe_bboxes_ltrb = []
     try:
         arr = json.loads(selected_face_bboxes) if (selected_face_bboxes or "").strip().startswith("[") else []
-        fe_bboxes_ltrb = [(bb[3], bb[0], bb[1], bb[2]) for bb in arr] if arr else []
+        fe_bboxes_ltrb = [tuple(int(v) for v in bb) for bb in arr] if arr else []
     except Exception:
         fe_bboxes_ltrb = []
 
