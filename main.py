@@ -4,7 +4,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import os, io, json, uuid, base64, numpy as np
 from PIL import Image
-import face_recognition
+import httpx
 
 from swap import swap_faces
 from upscale import upscale_image
@@ -180,14 +180,22 @@ async def swap_api(
     if len(source_bytes) > MAX_IMAGE_BYTES:
         return _bad_client("Source is too large.")
 
-    target_bytes = b""
-    if target is not None:
-        tb = await target.read()
-        if not tb:
-            return _bad_client("Target is empty.")
-        if len(tb) > MAX_IMAGE_BYTES:
-            return _bad_client("Target is too large.")
-        target_bytes = tb
+   # --- target handling ---
+    target_bytes = None
+
+    if target and target.filename:
+        target_bytes = await target.read()
+    elif target_url and target_url.strip():
+        async with httpx.AsyncClient() as client:
+            r = await client.get(target_url)
+            r.raise_for_status()
+            target_bytes = r.content
+
+    if not target_bytes:
+        raise HTTPException(status_code=400, detail="Target is empty.")
+
+    if len(target_bytes) > MAX_IMAGE_BYTES:
+        return _bad_client("Target is too large.")
 
     # File locations
     OUTPUT_DIR = "static/output"
@@ -203,7 +211,7 @@ async def swap_api(
     with open(source_path, "wb") as f:
         f.write(source_bytes)
 
-    # Target: prefer uploaded file; otherwise download from your existing proxy flow
+    # Target: prefer uploaded file; otherwise download from target_url if provided
     if target_bytes:
         try:
             Image.open(io.BytesIO(target_bytes)).verify()
@@ -211,14 +219,11 @@ async def swap_api(
             return _bad_client("Target is not a valid image.")
         with open(target_path, "wb") as f:
             f.write(target_bytes)
-    else:
-        # Use your existing server-side fetch endpoint logic
-        # We call internal function by making an HTTP request to /fetch_image, but since this is the same service
-        # just reuse the python 'requests' you already have below in your file.
+    elif (target_url or "").strip():
         import requests as _req
         fetch = _req.get(
             f"{request.base_url}fetch_image",
-            params={"url": target_url, "debug": "0"},
+            params={"url": target_url.strip(), "debug": "0"},
             headers={"Accept": "image/*"},
             timeout=20,
         )
@@ -226,6 +231,9 @@ async def swap_api(
             return _bad_client("Could not download target_url.")
         with open(target_path, "wb") as f:
             f.write(fetch.content)
+    else:
+        return _bad_client("Provide 'target' file or 'target_url'.")
+
 
     # Parse UI selection payloads (your helpers already exist)
     def _parse_bbox(s: str):
@@ -420,4 +428,3 @@ def job_status(job_id: str):
         return JSONResponse(status_code=404, content={"job_id": job_id, "status": "failed", "error": "unknown job_id"})
     # Shape: {job_id, status, download_url?, error?}
     return JSONResponse(job)
-
